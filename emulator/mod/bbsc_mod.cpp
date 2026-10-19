@@ -19,7 +19,9 @@
 // build (SetPersistentSessionPatches / SetHostLampPatches below).
 //
 // Log: logs\bbsc-mod-<date>-<time>-<pid>.log next to the DLL (one per game window, so two
-// windows on one PC do not overwrite each other); capture files in captures\ next to it.
+// windows on one PC do not overwrite each other); capture files in captures\ next to it. A host
+// whose mod folder is read-only (bbport's AppImage) points BBSC_DATA_DIR at a writable folder for
+// these, the journals and the save backups; LICENSE.txt and the notices stay next to the mod.
 
 #include <algorithm>
 #include <array>
@@ -82,6 +84,7 @@ constexpr auto SettleTime = 20ms;         // let the emulator finish its own loa
 constexpr auto WatchTime = 500ms;
 
 std::filesystem::path mod_dir;
+std::filesystem::path data_dir; // BBSC_DATA_DIR, else mod_dir
 std::ofstream log_file;
 std::mutex log_mutex;
 // The host's own view of memory (bbsc_attach), asked before the OS. Null: the OS only.
@@ -96,14 +99,16 @@ u64 NowMs() {
 
 void OpenLog() {
     mod_dir = Platform::ModulePath().parent_path();
+    const char* data = std::getenv("BBSC_DATA_DIR");
+    data_dir = data != nullptr && data[0] != '\0' ? std::filesystem::path{data} : mod_dir;
     const std::time_t now = std::time(nullptr);
     char name[96]{};
     std::strftime(name, sizeof(name), "bbsc-mod-%Y%m%d-%H%M%S", std::localtime(&now));
     const std::string file =
         std::string{name} + "-" + std::to_string(Platform::ProcessId()) + ".log";
     std::error_code ignored;
-    std::filesystem::create_directories(mod_dir / "logs", ignored);
-    log_file.open(mod_dir / "logs" / file);
+    std::filesystem::create_directories(data_dir / "logs", ignored);
+    log_file.open(data_dir / "logs" / file);
 }
 
 // ---- Byte patches --------------------------------------------------------------------------------
@@ -817,7 +822,7 @@ void CinematicForceOn() {
 
 namespace Common::FS {
 std::filesystem::path GetUserPath(PathType type) {
-    return type == PathType::CapturesDir ? mod_dir / "captures" : mod_dir;
+    return type == PathType::CapturesDir ? data_dir / "captures" : data_dir;
 }
 } // namespace Common::FS
 

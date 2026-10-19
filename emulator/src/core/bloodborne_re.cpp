@@ -5536,6 +5536,18 @@ const std::string& BbscProcessUserId() {
                 out += static_cast<char>(line[i++]);
             }
         }
+#else
+        // /proc/self/cmdline: every argument ends with a NUL.
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        bool next_is_id = false;
+        for (std::string arg; out.empty() && std::getline(cmdline, arg, '\0');) {
+            const std::string value =
+                next_is_id ? arg : arg.starts_with("--user-id=") ? arg.substr(10) : std::string{};
+            next_is_id = arg == "--user-id";
+            for (size_t i = 0; i < value.size() && value[i] >= '0' && value[i] <= '9'; ++i) {
+                out += value[i];
+            }
+        }
 #endif
         if (!out.empty()) {
             LOG_INFO(Debug, "BBSC save slot: this window plays as local user {} - only its saves "
@@ -5545,6 +5557,31 @@ const std::string& BbscProcessUserId() {
         return out;
     }();
     return id;
+}
+
+// The emulator's user folders that may hold saves: BBSC_USER_DIR alone when it is set (a host that
+// keeps its user folder elsewhere - bbport: its BB_USER_DIR), else shadPS4's portable folder
+// <working folder>/user, then its installed one (%APPDATA%\shadPS4, $XDG_DATA_HOME/shadPS4 or
+// ~/.local/share/shadPS4).
+std::vector<std::filesystem::path> BbscUserFolders() {
+    namespace fs = std::filesystem;
+    if (const char* dir = std::getenv("BBSC_USER_DIR"); dir != nullptr && dir[0] != '\0') {
+        return {fs::path(dir)};
+    }
+    std::error_code ec;
+    std::vector<fs::path> folders{fs::current_path(ec) / "user"};
+#ifdef _WIN32
+    if (const char* appdata = std::getenv("APPDATA")) {
+        folders.push_back(fs::path(appdata) / "shadPS4");
+    }
+#else
+    if (const char* data = std::getenv("XDG_DATA_HOME"); data != nullptr && data[0] != '\0') {
+        folders.push_back(fs::path(data) / "shadPS4");
+    } else if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+        folders.push_back(fs::path(home) / ".local" / "share" / "shadPS4");
+    }
+#endif
+    return folders;
 }
 
 // The character being played: the save slot file the game wrote last, during this run.
@@ -5562,19 +5599,18 @@ std::optional<BbscSaveSlot> BbscActiveSaveSlot() {
 std::optional<BbscSaveSlot> BbscActiveSaveSlotUnchecked() {
     namespace fs = std::filesystem;
     std::error_code ec;
-    // As shadPS4 picks its user folder: <working folder>\user when it exists (portable install),
-    // else %APPDATA%\shadPS4 - never both (another window may play from the other one).
-    std::vector<fs::path> bases{fs::current_path(ec) / "user"};
-#ifdef _WIN32
-    if (!fs::is_directory(bases.front() / "home", ec) &&
-        !fs::is_directory(bases.front() / "savedata", ec)) {
-        bases.clear();
-        if (const char* appdata = std::getenv("APPDATA")) {
-            bases.push_back(fs::path(appdata) / "shadPS4");
+    // As shadPS4 picks its user folder: <working folder>\user when it holds saves (portable
+    // install), else the installed one - never both (another window may play from the other one).
+    std::vector<fs::path> bases = BbscUserFolders();
+    if (bases.size() > 1) {
+        if (fs::is_directory(bases.front() / "home", ec) ||
+            fs::is_directory(bases.front() / "savedata", ec)) {
+            bases.resize(1);
+        } else {
+            bases.erase(bases.begin());
         }
     }
     ec.clear();
-#endif
     std::optional<BbscSaveSlot> best;
     fs::file_time_type best_time = bbsc_run_started;
     // BBSC_SAVE_DIR (2026-10-12): the folder holding userdata0000.. on hosts that keep saves
@@ -12437,14 +12473,8 @@ bool BackupBbscSaves() {
 
 bool BackupBbscSavesUnchecked() {
     namespace fs = std::filesystem;
-    std::vector<fs::path> bases;
+    const std::vector<fs::path> bases = BbscUserFolders();
     std::error_code ec;
-    bases.push_back(fs::current_path(ec) / "user");
-#ifdef _WIN32
-    if (const char* appdata = std::getenv("APPDATA")) {
-        bases.push_back(fs::path(appdata) / "shadPS4");
-    }
-#endif
     const auto stamp = std::chrono::system_clock::now().time_since_epoch();
     const fs::path out = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() /
                          "save-backups" /
