@@ -3,7 +3,13 @@
 
 /* BBSC mod: the entry point of libbbsc.so, for a host that loads the mod itself (bbport). The
  * Windows DLL needs none of this: it starts on its own when it is loaded (DllMain) and finds the
- * game itself. Plain C, so a C host can include it. */
+ * game itself. Plain C, so a C host can include it.
+ *
+ * Besides the player's settings (mod.json), a host may set:
+ *   BBSC_USER_DIR  its user folder (savedata/<user>/CUSA00207/...) when it is not shadPS4's;
+ *   BBSC_DATA_DIR  a writable folder for BBSC's logs, captures and save backups when the mod's own
+ *                  folder is read-only (LICENSE.txt, NOTICE.txt and SUPPORTERS.txt stay next to
+ *                  the library). */
 
 #ifndef BBSC_HOST_H
 #define BBSC_HOST_H

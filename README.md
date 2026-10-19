@@ -20,7 +20,7 @@ Dream - up to five hunters, each keeping their own character.
 - A co-op kit with no Insight cost: Hunt Bell, Kin Bell, Bloodlust Bell, Parting Blank, Duel Bell (PvP toggle)
 - Clear co-op messages in place of the vanilla "beckoner / resonance" lines
 - Public server, self-hosted servers (Radmin VPN, Tailscale, LAN, VPS) and split screen (Nucleus Co-op)
-- Runs in shadPS4 and in the BBport Windows build
+- Runs in shadPS4, in the BBport Windows build and, as `libbbsc.so`, in hosts that load it on Linux
 
 ## Requirements
 
@@ -57,6 +57,8 @@ Dream - up to five hunters, each keeping their own character.
 
 - Emulator: `build/build-shadp2p.cmd` (Windows, Visual Studio 2022, CMake, Ninja)
 - Mod DLL: `emulator/mod/build-mod.cmd`
+- Mod for Linux hosts: `emulator/mod/build-mod.sh` (`libbbsc.so`, started by the host with
+  `bbsc_attach`, see `emulator/mod/bbsc_host.h`)
 - Game server: Python 3, no extra packages (`server/gameserver/bbsc_gameserver.py --shadnet <address>`)
 
 ## Reporting bugs
