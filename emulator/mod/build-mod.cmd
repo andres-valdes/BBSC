@@ -1,8 +1,9 @@
 @echo off
 rem Builds the BBSC mod: bbsc.dll (injected into shadPS4) and bbsc-launch.exe (the injector).
 rem Output: <repo>\build\mod\ ; log: <repo>\build\mod-build.log (ends with exit=N)
-rem bbsc.dll = bbsc_mod.cpp + bbsc_hooks.cpp + bbsc_relay.cpp + bbsc_platform_win32.cpp + the emulator build's own
-rem src\core\bloodborne_re.cpp (BBSC_MOD), with mod\shim\ answering its emulator includes.
+rem bbsc.dll = bbsc_mod.cpp + bbsc_hooks.cpp + bbsc_relay.cpp + bbsc_platform_win32.cpp + the
+rem emulator build's own src\core\bloodborne_re.cpp (BBSC_MOD), with mod\shim\ answering its
+rem emulator includes. Linux: build-mod.sh.
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 set "PATH=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin;%PATH%"
 set "SRC=%~dp0"

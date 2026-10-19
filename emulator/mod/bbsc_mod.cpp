@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 CLS_AMG
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// BBSC as a mod: a DLL that bbsc-launch.exe injects into shadPS4.exe before it starts.
+// BBSC as a mod: a DLL that bbsc-launch.exe injects into shadPS4.exe before it starts, or a shared
+// library (libbbsc.so) that a Linux host such as bbport loads itself and starts with bbsc_attach
+// (bbsc_host.h) before the game runs - the same steps below, without the waiting.
 //
 // The DLL runs in the emulator's process, where the game's memory sits at its guest addresses
 // (eboot at 0x800000000 in the shadp2p fork; the official shadPS4 nightly of 2026-10-09 loads it
@@ -36,6 +38,7 @@
 #include <vector>
 #include <string>
 
+#include "bbsc_host.h"
 #include "bbsc_platform.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
@@ -81,6 +84,9 @@ constexpr auto WatchTime = 500ms;
 std::filesystem::path mod_dir;
 std::ofstream log_file;
 std::mutex log_mutex;
+// The host's own view of memory (bbsc_attach), asked before the OS. Null: the OS only.
+int (*host_query_memory)(uint64_t address, uint64_t* start, uint64_t* end,
+                         uint32_t* prot) = nullptr;
 
 u64 NowMs() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -115,6 +121,11 @@ constexpr u64 RegionCacheMs = 250;
 constexpr size_t RegionCacheSize = 16;
 
 bool CachedQueryRegion(u64 address, Platform::Region& out) {
+    if (host_query_memory != nullptr &&
+        host_query_memory(address, &out.start, &out.end, &out.prot) != 0) {
+        out.mapped = true;
+        return true;
+    }
     thread_local std::array<CachedRegion, RegionCacheSize> cache{};
     thread_local size_t next = 0;
     const u64 now = NowMs();
@@ -312,7 +323,9 @@ bool NoticesPresent() {
            holds("SUPPORTERS.txt", "BBSC SUPPORTERS");
 }
 
-void Worker() {
+// The log, the license files and the public-server rule: what both start-ups do before they look
+// at the game. False = BBSC stays off.
+bool Prepare() {
     OpenLog();
     BbscMod::LogPlain("BBSC mod loaded - version " BBSC_VERSION);
     if (!NoticesPresent()) {
@@ -323,7 +336,7 @@ void Worker() {
                                     "BBSC mod folder (or was changed), so BBSC is off.\n\nThese "
                                     "files have to travel with BBSC.\nDownload the full package "
                                     "again from:\nhttps://github.com/Classmg22/BBSC");
-        return;
+        return false;
     }
     LOG_INFO(Mod, "BBSC mod in pid {} ({})", Platform::ProcessId(),
              Common::FS::PathToUTF8String(Platform::ExecutablePath()));
@@ -344,57 +357,36 @@ void Worker() {
         }
     }
     BuildSites();
+    return true;
+}
 
-    const u64 started = NowMs();
-    while ((EbootBase = FindEbootBase()) == 0) {
-        if (NowMs() - started > WaitForImageMs) {
-            LOG_ERROR(Mod, "No Bloodborne CUSA03173 01.09 image in memory after {} s - not this "
-                           "game or not this version; nothing was changed",
-                      WaitForImageMs / 1000);
-            return;
-        }
-        std::this_thread::sleep_for(50ms);
-    }
-    LOG_INFO(Mod, "Game image found at {:#x}{}", EbootBase,
-             EbootBase == ForkEbootBase ? "" : " (not the shadp2p fork's address)");
-    // shadPS4 maps the game's code writable; other hosts (bbhost) keep it read-only, and the
-    // shared hook code writes some code bytes directly. Make the image's code writable like shadPS4.
-    {
-        int unlocked = 0;
-        Platform::Region region;
-        u64 at = EbootBase;
-        while (at < EbootBase + EbootSize && Platform::QueryRegion(at, region)) {
-            if (region.mapped && (region.prot & Platform::ProtExec) != 0 &&
-                (region.prot & Platform::ProtWrite) == 0) {
-                const u64 start = std::max(region.start, EbootBase);
-                const u64 end = std::min<u64>(region.end, EbootBase + EbootSize);
-                if (Platform::Protect(start, end - start,
-                                      Platform::ProtRead | Platform::ProtWrite | Platform::ProtExec,
-                                      nullptr)) {
-                    ++unlocked;
-                }
+// shadPS4 maps the game's code writable; other hosts (bbhost) keep it read-only, and the shared
+// hook code writes some code bytes directly. Make the image's code writable like shadPS4.
+void UnlockCode() {
+    int unlocked = 0;
+    Platform::Region region;
+    u64 at = EbootBase;
+    while (at < EbootBase + EbootSize && Platform::QueryRegion(at, region)) {
+        if (region.mapped && (region.prot & Platform::ProtExec) != 0 &&
+            (region.prot & Platform::ProtWrite) == 0) {
+            const u64 start = std::max(region.start, EbootBase);
+            const u64 end = std::min<u64>(region.end, EbootBase + EbootSize);
+            if (Platform::Protect(start, end - start,
+                                  Platform::ProtRead | Platform::ProtWrite | Platform::ProtExec,
+                                  nullptr)) {
+                ++unlocked;
             }
-            at = region.end;
         }
-        if (unlocked != 0) {
-            LOG_INFO(Mod, "Game code made writable ({} region(s)) - this host maps it read-only",
-                     unlocked);
-        }
+        at = region.end;
     }
-    const Site* bad = nullptr;
-    while (!AllSitesKnown(&bad)) {
-        if (NowMs() - started > WaitForImageMs) {
-            LOG_ERROR(Mod,
-                      "No Bloodborne CUSA03173 01.09 image after {} s (first unknown site: {} at "
-                      "{:#x}) - not this game or not this version; nothing was changed",
-                      WaitForImageMs / 1000, bad ? bad->name : "?", bad ? bad->offset : 0);
-            return;
-        }
-        std::this_thread::sleep_for(1ms);
+    if (unlocked != 0) {
+        LOG_INFO(Mod, "Game code made writable ({} region(s)) - this host maps it read-only",
+                 unlocked);
     }
-    std::this_thread::sleep_for(SettleTime);
-    const u64 verified = NowMs() - started;
+}
 
+// The patches, the hooks and BBSC's own services, once every site of the image is known.
+void Install(u64 started, u64 verified) {
     MemoryPatcher::g_eboot_address = EbootBase;
     MemoryPatcher::g_eboot_image_size = EbootSize;
     MemoryPatcher::g_game_serial = "CUSA03173";
@@ -418,7 +410,10 @@ void Worker() {
     Core::Bbsc::InstallPadWrapper();
     BbscMod::StartDiscordStatus();
     LOG_INFO(Mod, "BBSC mod ready after {} ms", NowMs() - started);
+}
 
+// A patch site the host wrote back is written again.
+void WatchSites() {
     for (;;) {
         std::this_thread::sleep_for(WatchTime);
         std::scoped_lock lock{patch_mutex};
@@ -428,7 +423,73 @@ void Worker() {
     }
 }
 
+// The injected DLL: the emulator is still loading the game, so wait for it.
+void Worker() {
+    if (!Prepare()) {
+        return;
+    }
+    const u64 started = NowMs();
+    while ((EbootBase = FindEbootBase()) == 0) {
+        if (NowMs() - started > WaitForImageMs) {
+            LOG_ERROR(Mod, "No Bloodborne CUSA03173 01.09 image in memory after {} s - not this "
+                           "game or not this version; nothing was changed",
+                      WaitForImageMs / 1000);
+            return;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    LOG_INFO(Mod, "Game image found at {:#x}{}", EbootBase,
+             EbootBase == ForkEbootBase ? "" : " (not the shadp2p fork's address)");
+    UnlockCode();
+    const Site* bad = nullptr;
+    while (!AllSitesKnown(&bad)) {
+        if (NowMs() - started > WaitForImageMs) {
+            LOG_ERROR(Mod,
+                      "No Bloodborne CUSA03173 01.09 image after {} s (first unknown site: {} at "
+                      "{:#x}) - not this game or not this version; nothing was changed",
+                      WaitForImageMs / 1000, bad ? bad->name : "?", bad ? bad->offset : 0);
+            return;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    std::this_thread::sleep_for(SettleTime);
+    Install(started, NowMs() - started);
+    WatchSites();
+}
+
 } // namespace
+
+#ifndef _WIN32
+// A host that loads the mod itself, before the game runs (bbsc_host.h): the image is complete, so
+// it is checked once, and every site before anything is changed.
+extern "C" __attribute__((visibility("default"))) int bbsc_attach(const BbscHost* host) {
+    static std::atomic<bool> attached{false};
+    if (host == nullptr || attached.exchange(true) || !Prepare()) {
+        return -1;
+    }
+    if (host->version != BBSC_HOST_VERSION) {
+        LOG_ERROR(Mod, "The host speaks BBSC host interface {}, this BBSC {} - BBSC is off",
+                  host->version, BBSC_HOST_VERSION);
+        return -1;
+    }
+    host_query_memory = host->query_memory;
+    const u64 started = NowMs();
+    EbootBase = host->image_base != 0 ? host->image_base : FindEbootBase();
+    const Site* bad = nullptr;
+    if (EbootBase == 0 || !AllSitesKnown(&bad)) {
+        LOG_ERROR(Mod, "No Bloodborne CUSA03173 01.09 image at {:#x} (first unknown site: {} at "
+                       "{:#x}) - not this game or not this version; nothing was changed",
+                  EbootBase, bad ? bad->name : "?", bad ? bad->offset : 0);
+        EbootBase = 0;
+        return -1;
+    }
+    LOG_INFO(Mod, "Game image at {:#x}, given by the host", EbootBase);
+    UnlockCode();
+    Install(started, NowMs() - started);
+    std::thread(WatchSites).detach();
+    return 0;
+}
+#endif
 
 // ---- Logging -------------------------------------------------------------------------------------
 
