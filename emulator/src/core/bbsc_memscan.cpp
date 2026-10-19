@@ -5,6 +5,15 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/uio.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cinttypes>
+#include <cstdio>
+#include <fstream>
+#include <string>
 #endif
 
 #include <cstring>
@@ -33,6 +42,56 @@ void SearchRegion(const std::uint8_t* start, std::size_t size, const std::uint8_
             ++at;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+#else
+// The readable mappings of this process overlapping [lo, hi), clipped to it.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ReadableRanges(std::uint64_t lo,
+                                                                    std::uint64_t hi) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        std::uint64_t start = 0;
+        std::uint64_t end = 0;
+        char perms[5]{};
+        if (std::sscanf(line.c_str(), "%" SCNx64 "-%" SCNx64 " %4s", &start, &end, perms) == 3 &&
+            perms[0] == 'r' && end > lo && start < hi) {
+            ranges.emplace_back(std::max(start, lo), std::min(end, hi));
+        }
+    }
+    return ranges;
+}
+
+// One range, read in chunks through process_vm_readv: the emulator changes and drops mappings all
+// the time, and a page gone since /proc/self/maps was read just ends the chunk instead of faulting.
+void SearchRange(std::uint64_t start, std::uint64_t end, std::span<const std::uint8_t> needle,
+                 std::vector<std::uint64_t>& hits, std::size_t max_hits) {
+    constexpr std::uint64_t Chunk = 1 << 20;
+    std::vector<std::uint8_t> buffer(Chunk + needle.size() - 1);
+    for (std::uint64_t at = start; at < end && hits.size() < max_hits; at += Chunk) {
+        const auto want =
+            static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), end - at));
+        iovec local{buffer.data(), want};
+        iovec remote{reinterpret_cast<void*>(at), want};
+        const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        if (got < static_cast<ssize_t>(needle.size())) {
+            continue;
+        }
+        // Matches starting in the overlap are found again by the next chunk.
+        const std::size_t last =
+            std::min<std::size_t>(static_cast<std::size_t>(got) - needle.size(), Chunk - 1);
+        for (std::size_t i = 0; i <= last && hits.size() < max_hits; ++i) {
+            const auto* found = static_cast<const std::uint8_t*>(
+                std::memchr(buffer.data() + i, needle[0], last - i + 1));
+            if (found == nullptr) {
+                break;
+            }
+            i = static_cast<std::size_t>(found - buffer.data());
+            if (std::memcmp(found, needle.data(), needle.size()) == 0) {
+                hits.push_back(at + i);
+            }
+        }
     }
 }
 #endif
@@ -65,6 +124,16 @@ std::vector<std::uint64_t> FindInMemory(std::span<const std::uint8_t> needle, st
             break;
         }
         at = end;
+    }
+#else
+    if (needle.empty()) {
+        return hits;
+    }
+    for (const auto& [start, end] : ReadableRanges(lo, hi)) {
+        if (hits.size() >= max_hits) {
+            break;
+        }
+        SearchRange(start, end, needle, hits, max_hits);
     }
 #endif
     return hits;
