@@ -26,14 +26,14 @@
 // Switch SHADPS4_BBSC_P2P_CHANNEL (Mods tab, on). Datagrams can be lost: every BBSC packet was
 // made for the emulator's UDP signaling first and is re-sent or repeated by its sender.
 
-#include <windows.h>
-
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/logging/log.h"
@@ -43,9 +43,12 @@ namespace BbscMod {
 u64 EbootAddress(); // bbsc_mod.cpp
 void GuardSlot(u64 slot_offset, u64 wrapper, void** original, const char* name);
 void RelayDispatch(const std::vector<u8>& wrapped); // bbsc_relay.cpp
+void WriteSlot(u64 address, u64 value);             // bbsc_mod.cpp
 } // namespace BbscMod
 
 namespace {
+
+using namespace std::chrono_literals;
 
 constexpr u64 EbootSize = 0x056D4000ULL;
 constexpr u64 SlotSocket = 0x053E4B00;
@@ -103,7 +106,9 @@ std::atomic<u32> sent_count{0};
 std::atomic<u32> received_count{0};
 
 s64 NowMs() {
-    return static_cast<s64>(GetTickCount64());
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 std::string AddressText(u32 addr, u16 port) {
@@ -176,16 +181,12 @@ bool Swap(u64 slot_offset, Fn wrapper, Fn& original, const char* name) {
         if (value != 0 &&
             (value < BbscMod::EbootAddress() || value >= BbscMod::EbootAddress() + EbootSize)) {
             original = reinterpret_cast<Fn>(value);
-            DWORD old = 0;
-            VirtualProtect(slot, 8, PAGE_READWRITE, &old);
-            *slot = reinterpret_cast<u64>(wrapper);
-            DWORD ignored = 0;
-            VirtualProtect(slot, 8, old, &ignored);
+            BbscMod::WriteSlot(reinterpret_cast<u64>(slot), reinterpret_cast<u64>(wrapper));
             BbscMod::GuardSlot(slot_offset, reinterpret_cast<u64>(wrapper),
                                reinterpret_cast<void**>(&original), name);
             return true;
         }
-        Sleep(1);
+        std::this_thread::sleep_for(1ms);
     }
     return false;
 }
@@ -239,7 +240,7 @@ bool OpenSocket() {
     return true;
 }
 
-DWORD WINAPI ChannelThread(void*) {
+void ChannelThread() {
     std::vector<u8> buffer(MaxDatagram);
     s64 next_open_ms = 0;
     int failures = 0;
@@ -258,7 +259,7 @@ DWORD WINAPI ChannelThread(void*) {
                     LOG_ERROR(Mod, "P2P channel: no socket after 10 tries - channel off for this run");
                 }
             }
-            Sleep(100);
+            std::this_thread::sleep_for(100ms);
             continue;
         }
         bool got_any = false;
@@ -284,7 +285,7 @@ DWORD WINAPI ChannelThread(void*) {
                          received);
             }
         }
-        Sleep(got_any ? 1 : 5);
+        std::this_thread::sleep_for(got_any ? 1ms : 5ms);
     }
 }
 
@@ -355,9 +356,7 @@ void StartP2PChannel() {
     Swap<ConnectionStatusFn>(SlotConnectionStatus, &ConnectionStatus, original_connection_status,
                              "ConnectionStatus");
     enabled = true;
-    if (HANDLE thread = CreateThread(nullptr, 0, ChannelThread, nullptr, 0, nullptr)) {
-        CloseHandle(thread);
-    }
+    std::thread(ChannelThread).detach();
     LOG_INFO(Mod, "P2P channel: ready (vport {}), waiting for the players of a session",
              ChannelVport);
 }

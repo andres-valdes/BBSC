@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // BBSC Discord status: "Playing BBSC - In Central Yharnam - Hosting (2 of 5)", or the boss during a
-// boss fight. Talks to the Discord app's local pipe (\\.\pipe\discord-ipc-N) itself - no Discord
-// library: a frame is {u32 opcode, u32 length, JSON}; opcode 0 = handshake with the application ID,
-// opcode 1 = a command (SET_ACTIVITY). The game state comes from bloodborne_re.cpp's game tick
-// (GetBbscPresence). Off with the Mods tab switch "Discord status" (SHADPS4_BBSC_DISCORD=0).
-// No Discord running = nothing happens; it tries again every 20 s.
-
-#include <windows.h>
+// boss fight. Talks to the Discord app's local IPC endpoint (Platform::DiscordIpcOpen) itself - no
+// Discord library: a frame is {u32 opcode, u32 length, JSON}; opcode 0 = handshake with the
+// application ID, opcode 1 = a command (SET_ACTIVITY). The game state comes from
+// bloodborne_re.cpp's game tick (GetBbscPresence). Off with the Mods tab switch "Discord status"
+// (SHADPS4_BBSC_DISCORD=0). No Discord running = nothing happens; it tries again every 20 s.
 
 #include <chrono>
 #include <cstdint>
@@ -19,6 +17,7 @@
 
 #include <fmt/format.h>
 
+#include "bbsc_platform.h"
 #include "core/bloodborne_re.h"
 
 namespace BbscMod {
@@ -26,6 +25,8 @@ void LogPlain(const char* text);
 }
 
 namespace {
+
+namespace Platform = BbscMod::Platform;
 
 constexpr const char* DiscordApplicationId = "1554935855674691645"; // "BBSC" (CLS_AMG)
 
@@ -56,15 +57,10 @@ public:
     }
 
     bool Connect() {
-        for (int i = 0; i < 10; ++i) {
-            const std::wstring name = L"\\\\.\\pipe\\discord-ipc-" + std::to_wstring(i);
-            pipe = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                               0, nullptr);
-            if (pipe != INVALID_HANDLE_VALUE) {
-                break;
-            }
+        for (int i = 0; i < 10 && pipe < 0; ++i) {
+            pipe = Platform::DiscordIpcOpen(i);
         }
-        if (pipe == INVALID_HANDLE_VALUE) {
+        if (pipe < 0) {
             return false;
         }
         if (!Send(0, fmt::format("{{\"v\":1,\"client_id\":\"{}\"}}", DiscordApplicationId))) {
@@ -75,7 +71,7 @@ public:
     }
 
     bool Send(std::uint32_t opcode, const std::string& json) {
-        if (pipe == INVALID_HANDLE_VALUE) {
+        if (pipe < 0) {
             return false;
         }
         std::string frame(8, '\0');
@@ -83,17 +79,15 @@ public:
         std::memcpy(frame.data(), &opcode, 4);
         std::memcpy(frame.data() + 4, &length, 4);
         frame += json;
-        DWORD written = 0;
-        return WriteFile(pipe, frame.data(), static_cast<DWORD>(frame.size()), &written, nullptr) &&
-               written == frame.size();
+        return Platform::DiscordIpcWrite(pipe, frame.data(), frame.size());
     }
 
     // Reads whatever Discord sent (answers, READY) so the pipe never fills. wait = block for one
     // frame (the handshake answer). False = the pipe is gone or Discord closed it (opcode 2).
     bool Drain(bool wait) {
         for (;;) {
-            DWORD available = 0;
-            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+            size_t available = 0;
+            if (!Platform::DiscordIpcAvailable(pipe, available)) {
                 Close();
                 return false;
             }
@@ -101,14 +95,12 @@ public:
                 return true;
             }
             std::uint32_t header[2]{};
-            DWORD got = 0;
-            if (!ReadFile(pipe, header, 8, &got, nullptr) || got != 8) {
+            if (!Platform::DiscordIpcRead(pipe, header, 8)) {
                 Close();
                 return false;
             }
             std::string body(header[1], '\0');
-            if (header[1] != 0 &&
-                (!ReadFile(pipe, body.data(), header[1], &got, nullptr) || got != header[1])) {
+            if (!Platform::DiscordIpcRead(pipe, body.data(), body.size())) {
                 Close();
                 return false;
             }
@@ -122,18 +114,18 @@ public:
     }
 
     bool Connected() const {
-        return pipe != INVALID_HANDLE_VALUE;
+        return pipe >= 0;
     }
 
     void Close() {
-        if (pipe != INVALID_HANDLE_VALUE) {
-            CloseHandle(pipe);
-            pipe = INVALID_HANDLE_VALUE;
+        if (pipe >= 0) {
+            Platform::DiscordIpcClose(pipe);
+            pipe = -1;
         }
     }
 
 private:
-    HANDLE pipe = INVALID_HANDLE_VALUE;
+    s64 pipe = -1;
 };
 
 std::string ActivityJson(const Core::Bloodborne::BbscPresence& p, std::int64_t game_start_s) {
@@ -161,13 +153,13 @@ std::string ActivityJson(const Core::Bloodborne::BbscPresence& p, std::int64_t g
     activity += ",\"assets\":{\"large_image\":\"bbsc\",\"large_text\":" + Json(large_text) + "}";
     if (p.in_game && p.role != 0) {
         activity += fmt::format(",\"party\":{{\"id\":\"bbsc-{}\",\"size\":[{},{}]}}",
-                                GetCurrentProcessId(), p.hunters, p.max_hunters);
+                                Platform::ProcessId(), p.hunters, p.max_hunters);
     }
     activity += "}";
     return activity;
 }
 
-DWORD WINAPI DiscordThread(LPVOID) {
+void DiscordThread() {
     const std::int64_t game_start_s = std::chrono::duration_cast<std::chrono::seconds>(
                                           std::chrono::system_clock::now().time_since_epoch())
                                           .count();
@@ -201,7 +193,7 @@ DWORD WINAPI DiscordThread(LPVOID) {
         }
         const std::string command = fmt::format(
             "{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{},\"activity\":{}}},\"nonce\":\"{}\"}}",
-            GetCurrentProcessId(), activity, ++nonce);
+            Platform::ProcessId(), activity, ++nonce);
         if (discord.Send(1, command)) {
             sent = activity;
         } else {
@@ -219,10 +211,8 @@ void StartDiscordStatus() {
         LogPlain("Discord status: off (Mods tab)");
         return;
     }
-    if (HANDLE thread = CreateThread(nullptr, 0, DiscordThread, nullptr, 0, nullptr)) {
-        CloseHandle(thread);
-        LogPlain("Discord status: on - shows when the Discord app is running");
-    }
+    std::thread(DiscordThread).detach();
+    LogPlain("Discord status: on - shows when the Discord app is running");
 }
 
 } // namespace BbscMod

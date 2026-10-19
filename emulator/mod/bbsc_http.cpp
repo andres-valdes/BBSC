@@ -30,13 +30,12 @@
 // Not done: the emulator's 3 s "fast sign" re-posts. They replaced the game's own reply; extra
 // posts from here would take the broker's claim themselves and the game would never join.
 
-#include <windows.h>
-#include <winhttp.h>
-
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <thread>
@@ -47,17 +46,23 @@
 #include <utility>
 #include <vector>
 
+#include "bbsc_platform.h"
 #include "common/logging/log.h"
 #include "common/types.h"
 #include "core/bloodborne_re.h"
+#include "core/memory.h"
 
 namespace BbscMod {
 void RelaySendPlacement(const std::string& placement);
 u64 EbootAddress(); // bbsc_mod.cpp: where the game image is (0 until found)
 void GuardSlot(u64 slot_offset, u64 wrapper, void** original, const char* name); // bbsc_mod.cpp
+void WriteSlot(u64 address, u64 value);                                         // bbsc_mod.cpp
+std::vector<std::filesystem::path> HostOverrideFiles();
 }
 
 namespace {
+
+using namespace std::chrono_literals;
 
 constexpr u64 EbootSize = 0x056D4000ULL;
 constexpr u64 SlotCreateConnection = 0x053E5618;
@@ -107,12 +112,14 @@ std::atomic<s64> claim_delivered_ms{0}; // our sign's reply carried a host's cla
 std::atomic<bool> was_in_session{false};
 
 s64 NowMs() {
-    return static_cast<s64>(GetTickCount64());
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 // ---- host_overrides.json ------------------------------------------------------------------------
 
-std::string ReadFile(const std::wstring& path) {
+std::string ReadFile(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     std::stringstream text;
     text << in.rdbuf();
@@ -121,30 +128,21 @@ std::string ReadFile(const std::wstring& path) {
 
 // {"prefix": "replacement", ...} - flat string pairs, as JOIN-HOST writes them.
 void LoadOverrides() {
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring dir{exe};
-    const std::wstring exe_name = dir.substr(dir.find_last_of(L"\\/") + 1);
-    dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
+    std::string exe_name = BbscMod::Platform::ExecutablePath().filename().string();
+    for (char& c : exe_name) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
     // bbhost sends the game's URLs to its own server ([online] host) itself. shadPS4's
     // host_overrides.json on the same PC pointed them at another server (2026-10-12: game API on
     // the shadPS4 server, NP sessions on bbhost's - nothing matched). BBSC_URL_OVERRIDES=0 does the
     // same for any host.
     const char* switch_env = std::getenv("BBSC_URL_OVERRIDES");
-    if (_wcsnicmp(exe_name.c_str(), L"bbhost", 6) == 0 || (switch_env && switch_env[0] == '0')) {
+    if (exe_name.starts_with("bbhost") || (switch_env && switch_env[0] == '0')) {
         LOG_INFO(Mod, "HTTP: URL overrides off ({}) - the host sends the game's URLs itself",
                  switch_env && switch_env[0] == '0' ? "BBSC_URL_OVERRIDES=0" : "bbhost");
         return;
     }
-    // The emulator's own rule: a "user" folder in the folder it was started in wins (portable).
-    wchar_t cwd[MAX_PATH]{};
-    GetCurrentDirectoryW(MAX_PATH, cwd);
-    std::vector<std::wstring> candidates{std::wstring(cwd) + L"\\user\\host_overrides.json",
-                                        dir + L"user\\host_overrides.json"};
-    if (const wchar_t* appdata = _wgetenv(L"APPDATA")) {
-        candidates.push_back(std::wstring(appdata) + L"\\shadPS4\\host_overrides.json");
-    }
-    for (const auto& path : candidates) {
+    for (const auto& path : BbscMod::HostOverrideFiles()) {
         const std::string json = ReadFile(path);
         std::vector<std::string> strings;
         for (size_t at = json.find('"'); at != std::string::npos; at = json.find('"', at)) {
@@ -287,47 +285,6 @@ std::string JsonNumber(const std::string& body, const char* key) {
     return body.substr(at + needle.size(), end - at - needle.size());
 }
 
-// One plain POST with WinHTTP (the stale-record delete). Returns the status code, 0 on failure.
-DWORD Post(const std::string& url, const std::string& body) {
-    std::wstring wide(url.begin(), url.end());
-    URL_COMPONENTS parts{sizeof(parts)};
-    wchar_t host[256]{};
-    wchar_t path[2048]{};
-    parts.lpszHostName = host;
-    parts.dwHostNameLength = 256;
-    parts.lpszUrlPath = path;
-    parts.dwUrlPathLength = 2048;
-    if (!WinHttpCrackUrl(wide.c_str(), 0, 0, &parts)) {
-        return 0;
-    }
-    DWORD status = 0;
-    HINTERNET session = WinHttpOpen(L"BBSC", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
-    HINTERNET connect = session ? WinHttpConnect(session, host, parts.nPort, 0) : nullptr;
-    HINTERNET request =
-        connect ? WinHttpOpenRequest(connect, L"POST", path, nullptr, nullptr, nullptr,
-                                     parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
-                : nullptr;
-    if (request != nullptr) {
-        WinHttpSetTimeouts(request, 1000, 1000, 1000, 1500);
-        const wchar_t* headers =
-            L"Content-Type: application/json\r\nX-ShadPS4-Bloodborne-Seamless: 1\r\n";
-        if (WinHttpSendRequest(request, headers, static_cast<DWORD>(-1),
-                               const_cast<char*>(body.data()), static_cast<DWORD>(body.size()),
-                               static_cast<DWORD>(body.size()), 0) &&
-            WinHttpReceiveResponse(request, nullptr)) {
-            DWORD size = sizeof(status);
-            WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                nullptr, &status, &size, nullptr);
-        }
-    }
-    for (HINTERNET h : {request, connect, session}) {
-        if (h != nullptr) {
-            WinHttpCloseHandle(h);
-        }
-    }
-    return status;
-}
-
 // The broker keeps Preparing/Claimed/Delivered records 15 minutes and Bloodborne reuses its
 // SessionId/UserId after a restart, so the first seamless sign of this run removes any old one.
 void ClearStaleRecord(const std::string& url, const std::string& body) {
@@ -346,7 +303,9 @@ void ClearStaleRecord(const std::string& url, const std::string& body) {
                                 session + "\",\"UserId\":" + user + ",\"Force\":true}";
     // It must finish before the new sign is created (the delete names the same session), so it
     // stays on this thread - the game's - with short timeouts (2026-10-08: up to 14 s before).
-    const DWORD status = Post(removal_url, removal);
+    const u32 status = BbscMod::Platform::HttpPost(
+        removal_url, removal,
+        "Content-Type: application/json\r\nX-ShadPS4-Bloodborne-Seamless: 1\r\n");
     LOG_INFO(Mod, "HTTP: stale summon cleanup for session {} user {}: status {}", session, user,
              status);
 }
@@ -362,13 +321,7 @@ void ClearStaleRecord(const std::string& url, const std::string& body) {
 //   - we were in a session (joining, guest or host) and are back to posting signs.
 s32 SessionState() {
     const u64 manager = *reinterpret_cast<const u64*>(BbscMod::EbootAddress() + 0x05540290);
-    MEMORY_BASIC_INFORMATION info{};
-    constexpr DWORD Readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    if (manager >= 0x10000 && VirtualQuery(reinterpret_cast<void*>(manager + 0x124), &info,
-                                           sizeof(info)) != 0 &&
-        info.State == MEM_COMMIT && (info.Protect & Readable) != 0 &&
-        (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0) {
+    if (manager >= 0x10000 && Core::Memory::Instance()->IsValidMapping(manager + 0x124, 4)) {
         return *reinterpret_cast<const s32*>(manager + 0x124);
     }
     return -1;
@@ -567,16 +520,12 @@ bool Swap(u64 slot_offset, Fn wrapper, Fn& original, const char* name) {
         const u64 value = *slot;
         if (value != 0 && (value < BbscMod::EbootAddress() || value >= BbscMod::EbootAddress() + EbootSize)) {
             original = reinterpret_cast<Fn>(value);
-            DWORD old = 0;
-            VirtualProtect(slot, 8, PAGE_READWRITE, &old);
-            *slot = reinterpret_cast<u64>(wrapper);
-            DWORD ignored = 0;
-            VirtualProtect(slot, 8, old, &ignored);
+            BbscMod::WriteSlot(reinterpret_cast<u64>(slot), reinterpret_cast<u64>(wrapper));
             BbscMod::GuardSlot(slot_offset, reinterpret_cast<u64>(wrapper),
                                reinterpret_cast<void**>(&original), name);
             return true;
         }
-        Sleep(1);
+        std::this_thread::sleep_for(1ms);
     }
     return false;
 }
@@ -589,7 +538,7 @@ u64 WaitForSlot(u64 slot_offset) {
         if (value != 0 && (value < BbscMod::EbootAddress() || value >= BbscMod::EbootAddress() + EbootSize)) {
             return value;
         }
-        Sleep(1);
+        std::this_thread::sleep_for(1ms);
     }
     return 0;
 }
@@ -597,6 +546,23 @@ u64 WaitForSlot(u64 slot_offset) {
 } // namespace
 
 namespace BbscMod {
+
+// Where host_overrides.json may be; the first that holds entries wins. The file the emulator was
+// told to read (SHADPS4_HTTP_HOST_OVERRIDES_JSON), then the emulator's own rule: a "user" folder in
+// the folder it was started in (portable), next to it, then its installed user folder.
+std::vector<std::filesystem::path> HostOverrideFiles() {
+    std::vector<std::filesystem::path> files;
+    if (const char* path = std::getenv("SHADPS4_HTTP_HOST_OVERRIDES_JSON"); path && path[0]) {
+        files.emplace_back(path);
+    }
+    std::error_code ignored;
+    files.push_back(std::filesystem::current_path(ignored) / "user" / "host_overrides.json");
+    files.push_back(Platform::ExecutablePath().parent_path() / "user" / "host_overrides.json");
+    if (const auto installed = Platform::InstalledUserFolder(); !installed.empty()) {
+        files.push_back(installed / "host_overrides.json");
+    }
+    return files;
+}
 
 // The relay asks before connecting (bbsc_relay.cpp): public servers run no BBSC relay.
 bool IsPublicServerAddress(const std::string& url_or_host) {

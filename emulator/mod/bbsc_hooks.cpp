@@ -16,14 +16,14 @@
 // whole instructions without RIP-relative operands. Every site BBSC hooks is a fixed, byte-checked
 // instruction sequence that the emulator build has already installed the same way.
 
-#include <windows.h>
-
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <mutex>
 
 #include <xbyak/xbyak.h>
 
+#include "bbsc_platform.h"
 #include "core/cpu_patches.h"
 
 namespace BbscMod {
@@ -48,11 +48,11 @@ bool area_ok = false;
 
 // The last 1 MB of the emulator's trampoline area after the image, when it is mapped RWX and unused.
 bool EmulatorAreaFree(u64 start) {
-    MEMORY_BASIC_INFORMATION info{};
-    if (VirtualQuery(reinterpret_cast<void*>(start), &info, sizeof(info)) == 0 ||
-        info.State != MEM_COMMIT ||
-        (info.Protect & (PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0 ||
-        reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize < start + OurSize) {
+    constexpr u32 Rwx = BbscMod::Platform::ProtRead | BbscMod::Platform::ProtWrite |
+                        BbscMod::Platform::ProtExec;
+    BbscMod::Platform::Region region;
+    if (!BbscMod::Platform::QueryRegion(start, region) || !region.mapped ||
+        (region.prot & Rwx) != Rwx || region.end < start + OurSize) {
         return false;
     }
     const auto* bytes = reinterpret_cast<const u8*>(start);
@@ -68,17 +68,15 @@ bool EmulatorAreaFree(u64 start) {
 u64 MapOwnArea(u64 image) {
     const u64 image_end = image + EbootAlignedSize + EmulatorTrampolineSize;
     for (u64 at = (image_end + 0xFFFF) & ~0xFFFFULL; at < image + JumpReach; at += 0x10000) {
-        if (void* got = VirtualAlloc(reinterpret_cast<void*>(at), OurSize, MEM_RESERVE | MEM_COMMIT,
-                                     PAGE_EXECUTE_READWRITE)) {
-            return reinterpret_cast<u64>(got);
+        if (const u64 got = BbscMod::Platform::MapExecutable(at, OurSize)) {
+            return got;
         }
     }
     const u64 low = image > JumpReach - EbootAlignedSize ? image + EbootAlignedSize - JumpReach
                                                          : 0x10000;
     for (u64 at = (image - OurSize) & ~0xFFFFULL; at >= low && at < image; at -= 0x10000) {
-        if (void* got = VirtualAlloc(reinterpret_cast<void*>(at), OurSize, MEM_RESERVE | MEM_COMMIT,
-                                     PAGE_EXECUTE_READWRITE)) {
-            return reinterpret_cast<u64>(got);
+        if (const u64 got = BbscMod::Platform::MapExecutable(at, OurSize)) {
+            return got;
         }
     }
     return 0;
@@ -110,8 +108,12 @@ bool CheckArea() {
 }
 
 bool WriteJump(u8* site, const void* target, size_t length) {
-    DWORD old = 0;
-    if (!VirtualProtect(site, length, PAGE_EXECUTE_READWRITE, &old)) {
+    const u64 address = reinterpret_cast<u64>(site);
+    u32 restore = 0;
+    if (!BbscMod::Platform::Protect(address, length,
+                                    BbscMod::Platform::ProtRead | BbscMod::Platform::ProtWrite |
+                                        BbscMod::Platform::ProtExec,
+                                    &restore)) {
         return false;
     }
     std::array<u8, 32> bytes{};
@@ -123,9 +125,8 @@ bool WriteJump(u8* site, const void* target, size_t length) {
         bytes[i] = 0x90;
     }
     std::memcpy(site, bytes.data(), length);
-    DWORD ignored = 0;
-    VirtualProtect(site, length, old, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), site, length);
+    BbscMod::Platform::Restore(address, length, restore);
+    BbscMod::Platform::FlushCode(address, length);
     return true;
 }
 
@@ -197,9 +198,9 @@ bool InstallGuestCodeHook(void* address, std::span<const u8> expected_instructio
             trampoline.vmovdqu(yword[rsp + offset], Xbyak::Ymm(static_cast<int>(index)));
         }
 
-        // The hook is Windows code: 32 bytes of shadow space and the MS x64 arguments are not
-        // what a PS4_SYSV_ABI function expects, so it is called the SysV way (rdi, rsi), exactly
-        // as the emulator does. A 32-byte gap below the snapshot keeps either convention safe.
+        // The hook is PS4_SYSV_ABI whatever the host's own convention (on Windows, MS x64), so it
+        // is called the SysV way (rdi, rsi), exactly as the emulator does. A 32-byte gap below the
+        // snapshot keeps the MS x64 shadow space safe too.
         trampoline.mov(r12, rsp);
         trampoline.sub(rsp, 32);
         trampoline.mov(rdi, tag);
@@ -252,8 +253,8 @@ bool InstallGuestCodeHook(void* address, std::span<const u8> expected_instructio
         BbscMod::LogPlain(error.what());
         return false;
     }
-    FlushInstructionCache(GetCurrentProcess(), trampoline_start,
-                          trampoline.getSize() - trampoline_offset);
+    BbscMod::Platform::FlushCode(reinterpret_cast<u64>(trampoline_start),
+                                 trampoline.getSize() - trampoline_offset);
     return WriteJump(code, trampoline_start, expected_instructions.size());
 }
 

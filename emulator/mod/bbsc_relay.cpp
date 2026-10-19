@@ -13,20 +13,32 @@
 // connection instead (bbsc_channel.cpp), and come back into Dispatch from there.
 //
 // Server address: BBSC_RELAY=host[:port], else the game server entry of host_overrides.json
-// (portable install: <emulator>\user\, else %APPDATA%\shadPS4\) - the address JOIN-HOST wrote.
+// (BbscMod::HostOverrideFiles) - the address JOIN-HOST wrote.
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
+#else
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "bbsc_platform.h"
 #include "common/types.h"
 #include "core/bloodborne_re.h"
 #include "core/libraries/np/np_signaling/np_signaling_bbsc.h"
@@ -38,9 +50,42 @@ void OnHostPlacement(const std::string& placement, u32 sender);
 bool IsPublicServerAddress(const std::string& url_or_host); // bbsc_http.cpp
 u32 P2PChannelSend(const void* data, u32 size);             // bbsc_channel.cpp
 u32 P2PChannelPeerCount();
+std::vector<std::filesystem::path> HostOverrideFiles(); // bbsc_http.cpp
 }
 
 namespace {
+
+using namespace std::chrono_literals;
+
+#ifdef _WIN32
+using Socket = SOCKET;
+constexpr Socket NoSocket = INVALID_SOCKET;
+constexpr int SendFlags = 0;
+
+void CloseSocket(Socket s) {
+    closesocket(s);
+}
+
+void SetSendTimeout(Socket s, u32 ms) {
+    const DWORD timeout = ms;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout),
+               sizeof(timeout));
+}
+#else
+using Socket = int;
+constexpr Socket NoSocket = -1;
+constexpr int SendFlags = MSG_NOSIGNAL; // a dropped server must not end the game with SIGPIPE
+
+void CloseSocket(Socket s) {
+    close(s);
+}
+
+void SetSendTimeout(Socket s, u32 ms) {
+    const timeval timeout{static_cast<time_t>(ms / 1000),
+                          static_cast<suseconds_t>(ms % 1000 * 1000)};
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+#endif
 
 constexpr u16 DefaultRelayPort = 20444;
 constexpr u8 FollowType = 0x20;
@@ -76,7 +121,7 @@ static_assert(sizeof(FollowPacket) == 0x22);
 
 std::mutex send_mutex;
 std::mutex dispatch_mutex; // the relay thread and the P2P channel's thread both deliver frames
-SOCKET relay = INVALID_SOCKET;
+Socket relay = NoSocket;
 std::atomic<int> peers{0};
 std::atomic<bool> started{false};
 u32 own_id = 0; // set once in StartRelay, never 0
@@ -86,7 +131,7 @@ void Log(const std::string& text) {
     BbscMod::LogPlain(("Relay: " + text).c_str());
 }
 
-std::string ReadFile(const std::wstring& path) {
+std::string ReadFile(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     std::stringstream text;
     text << in.rdbuf();
@@ -123,19 +168,7 @@ bool FindServer(std::string& host, u16& port) {
         host = value;
         return true;
     }
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring dir{exe};
-    dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
-    // The emulator's own rule: a "user" folder in the folder it was started in wins (portable).
-    wchar_t cwd[MAX_PATH]{};
-    GetCurrentDirectoryW(MAX_PATH, cwd);
-    std::vector<std::wstring> candidates{std::wstring(cwd) + L"\\user\\host_overrides.json",
-                                        dir + L"user\\host_overrides.json"};
-    if (const wchar_t* appdata = _wgetenv(L"APPDATA")) {
-        candidates.push_back(std::wstring(appdata) + L"\\shadPS4\\host_overrides.json");
-    }
-    for (const auto& path : candidates) {
+    for (const auto& path : BbscMod::HostOverrideFiles()) {
         host = HostFromOverrides(ReadFile(path));
         if (!host.empty()) {
             return true;
@@ -144,10 +177,10 @@ bool FindServer(std::string& host, u16& port) {
     return false;
 }
 
-bool ReadAll(SOCKET s, void* data, int size) {
+bool ReadAll(Socket s, void* data, int size) {
     auto* at = static_cast<char*>(data);
     while (size > 0) {
-        const int got = recv(s, at, size, 0);
+        const int got = static_cast<int>(recv(s, at, size, 0));
         if (got <= 0) {
             return false;
         }
@@ -182,16 +215,16 @@ u32 SendFrame(const void* data, u32 size) {
     std::memcpy(frame.data() + 9, &own_id, 4);
     std::memcpy(frame.data() + 13, &key, 4);
     std::memcpy(frame.data() + 4 + EnvelopeSize, data, size);
-    if (relay == INVALID_SOCKET) {
+    if (relay == NoSocket) {
         return BbscMod::P2PChannelSend(frame.data() + 4, wrapped);
     }
     int left = static_cast<int>(frame.size());
     const char* at = frame.data();
     while (left > 0) {
-        const int sent = send(relay, at, left, 0);
+        const int sent = static_cast<int>(send(relay, at, left, SendFlags));
         if (sent <= 0) {
-            closesocket(relay);
-            relay = INVALID_SOCKET;
+            CloseSocket(relay);
+            relay = NoSocket;
             return BbscMod::P2PChannelSend(frame.data() + 4, wrapped);
         }
         at += sent;
@@ -288,9 +321,11 @@ void Dispatch(const std::vector<u8>& wrapped) {
     }
 }
 
-DWORD WINAPI RelayThread(void*) {
+void RelayThread() {
+#ifdef _WIN32
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
     std::string last_problem;
     for (;;) {
         std::string host;
@@ -300,7 +335,7 @@ DWORD WINAPI RelayThread(void*) {
                 last_problem = "no server";
                 Log("no game server address (host_overrides.json / BBSC_RELAY) - retrying");
             }
-            Sleep(10'000);
+            std::this_thread::sleep_for(10s);
             continue;
         }
         if (BbscMod::IsPublicServerAddress(host)) {
@@ -310,39 +345,38 @@ DWORD WINAPI RelayThread(void*) {
                 Log("public game server (" + host + ") - no relay there; BBSC packets go over "
                     "the P2P channel");
             }
-            Sleep(30'000);
+            std::this_thread::sleep_for(30s);
             continue;
         }
         addrinfo hints{};
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
         addrinfo* found = nullptr;
-        SOCKET s = INVALID_SOCKET;
+        Socket s = NoSocket;
         if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &found) == 0) {
             s = socket(found->ai_family, found->ai_socktype, found->ai_protocol);
-            if (s != INVALID_SOCKET && connect(s, found->ai_addr, static_cast<int>(found->ai_addrlen)) != 0) {
-                closesocket(s);
-                s = INVALID_SOCKET;
+            if (s != NoSocket &&
+                connect(s, found->ai_addr, static_cast<int>(found->ai_addrlen)) != 0) {
+                CloseSocket(s);
+                s = NoSocket;
             }
             freeaddrinfo(found);
         }
-        if (s == INVALID_SOCKET) {
+        if (s == NoSocket) {
             const std::string problem = "cannot reach " + host + ":" + std::to_string(port);
             if (problem != last_problem) {
                 last_problem = problem;
                 Log(problem + " (game server not started, or an older one without the relay) - "
                               "retrying every 5 s");
             }
-            Sleep(5'000);
+            std::this_thread::sleep_for(5s);
             continue;
         }
-        BOOL on = TRUE;
+        const int on = 1;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&on), sizeof(on));
         // Frames are sent from the game thread (review 2026-10-08): a stalled server must not
         // freeze the game in send() - after 300 ms the frame fails and the link is rebuilt.
-        const DWORD send_timeout_ms = 300;
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&send_timeout_ms),
-                   sizeof(send_timeout_ms));
+        SetSendTimeout(s, 300);
         {
             std::scoped_lock lock{send_mutex};
             relay = s;
@@ -364,13 +398,13 @@ DWORD WINAPI RelayThread(void*) {
         {
             std::scoped_lock lock{send_mutex};
             if (relay == s) {
-                closesocket(relay);
-                relay = INVALID_SOCKET;
+                CloseSocket(relay);
+                relay = NoSocket;
             }
         }
         peers = 0;
         Log("connection lost - reconnecting");
-        Sleep(2'000);
+        std::this_thread::sleep_for(2s);
     }
 }
 
@@ -411,14 +445,11 @@ void RelaySendPlacement(const std::string& placement) {
 
 void StartRelay() {
     if (!started.exchange(true)) {
-        LARGE_INTEGER counter{};
-        QueryPerformanceCounter(&counter);
-        own_id = static_cast<u32>((static_cast<u64>(counter.QuadPart) ^ GetCurrentProcessId()) *
+        const auto counter = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        own_id = static_cast<u32>((static_cast<u64>(counter) ^ BbscMod::Platform::ProcessId()) *
                                   2654435761ull) |
                  1u;
-        if (HANDLE thread = CreateThread(nullptr, 0, RelayThread, nullptr, 0, nullptr)) {
-            CloseHandle(thread);
-        }
+        std::thread(RelayThread).detach();
     }
 }
 } // namespace BbscMod

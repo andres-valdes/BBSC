@@ -10714,27 +10714,10 @@ void TickBbscLifeBroadcast() {
 // window puts the local player back on the ground: the same in-map warp the respawn uses
 // (chr->vtable[0x5F8], see BbscRespawnInPlace) to the player's own position 0.5 m higher, then the
 // collision proxy reset 0x018BCF30(chr, 1) that the partner revive uses. Works solo and in co-op.
-#if defined(_WIN32) && defined(BBSC_MOD) // the DLL; the built-in build has no F8
-extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
-extern "C" __declspec(dllimport) void* __stdcall GetForegroundWindow();
-extern "C" __declspec(dllimport) unsigned long __stdcall GetWindowThreadProcessId(void* window,
-                                                                                  unsigned long* pid);
-extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessId();
-#endif
-
 void TickBbscUnstuckKey() {
-#if defined(_WIN32) && defined(BBSC_MOD) // the DLL; the built-in build has no F8
-    static bool was_down = false;
-    const bool down = (GetAsyncKeyState(0x77 /* VK_F8 */) & 0x8000) != 0;
-    const bool pressed = down && !was_down;
-    was_down = down;
-    if (!pressed || image_base == 0) {
+#ifdef BBSC_MOD // the mod; the built-in build has no F8
+    if (!Core::Bbsc::TakeUnstuckKey() || image_base == 0) {
         return;
-    }
-    unsigned long pid = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-    if (pid != GetCurrentProcessId()) {
-        return; // F8 pressed in another window
     }
     const u64 player = GetLocalPlayerCharacter();
     const auto here = ReadCharacterTransform(player);

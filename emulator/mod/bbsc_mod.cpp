@@ -19,21 +19,24 @@
 // Log: logs\bbsc-mod-<date>-<time>-<pid>.log next to the DLL (one per game window, so two
 // windows on one PC do not overwrite each other); capture files in captures\ next to it.
 
-#include <windows.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <string>
 
+#include "bbsc_platform.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
@@ -65,72 +68,68 @@ void InstallPadWrapper();
 
 namespace {
 
+namespace Platform = BbscMod::Platform;
+using namespace std::chrono_literals;
+
 constexpr u64 ForkEbootBase = 0x800000000ULL; // where the shadp2p fork puts it
 u64 EbootBase = 0; // found by FindEbootBase before anything else uses it
 constexpr u64 EbootSize = 0x056D4000ULL; // CUSA03173 01.09 image size
-constexpr DWORD WaitForImageMs = 180'000;
-constexpr DWORD SettleMs = 20;            // let the emulator finish its own load-time patching
-constexpr DWORD WatchMs = 500;
+constexpr u64 WaitForImageMs = 180'000;
+constexpr auto SettleTime = 20ms;         // let the emulator finish its own load-time patching
+constexpr auto WatchTime = 500ms;
 
-HMODULE self_module = nullptr;
 std::filesystem::path mod_dir;
-FILE* log_file = nullptr;
+std::ofstream log_file;
 std::mutex log_mutex;
 
+u64 NowMs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
 void OpenLog() {
-    wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW(self_module, path, MAX_PATH);
-    mod_dir = std::filesystem::path{path}.parent_path();
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-    wchar_t name[96]{};
-    swprintf(name, 96, L"bbsc-mod-%04u%02u%02u-%02u%02u%02u-%lu.log", now.wYear, now.wMonth, now.wDay,
-             now.wHour, now.wMinute, now.wSecond, GetCurrentProcessId());
+    mod_dir = Platform::ModulePath().parent_path();
+    const std::time_t now = std::time(nullptr);
+    char name[96]{};
+    std::strftime(name, sizeof(name), "bbsc-mod-%Y%m%d-%H%M%S", std::localtime(&now));
+    const std::string file =
+        std::string{name} + "-" + std::to_string(Platform::ProcessId()) + ".log";
     std::error_code ignored;
-    std::filesystem::create_directories(mod_dir / L"logs", ignored);
-    log_file = _wfopen((mod_dir / L"logs" / name).c_str(), L"w");
+    std::filesystem::create_directories(mod_dir / "logs", ignored);
+    log_file.open(mod_dir / "logs" / file);
 }
 
 // ---- Byte patches --------------------------------------------------------------------------------
 
-// VirtualQuery is a kernel call that shares the address-space lock with the emulator's constant
-// page-protection changes (GPU memory tracking). bloodborne_re.cpp checks every memory read, so
-// thousands of these per frame took the game to ~1 fps (2026-09-30, two testers). The emulator
-// build answers the same checks from its own memory map; here each game thread remembers the last
-// few regions it asked about for a moment.
+// Asking the OS (VirtualQuery) is a kernel call that shares the address-space lock with the
+// emulator's constant page-protection changes (GPU memory tracking). bloodborne_re.cpp checks every
+// memory read, so thousands of these per frame took the game to ~1 fps (2026-09-30, two testers).
+// The emulator build answers the same checks from its own memory map; here each game thread
+// remembers the last few regions it asked about for a moment.
 struct CachedRegion {
-    u64 start = 0;
-    u64 end = 0;
-    DWORD state = 0;
-    DWORD protect = 0;
+    Platform::Region region;
     u64 stamp_ms = 0;
 };
 constexpr u64 RegionCacheMs = 250;
 constexpr size_t RegionCacheSize = 16;
 
-bool QueryRegion(u64 address, CachedRegion& out) {
+bool CachedQueryRegion(u64 address, Platform::Region& out) {
     thread_local std::array<CachedRegion, RegionCacheSize> cache{};
     thread_local size_t next = 0;
-    const u64 now = GetTickCount64();
-    for (const CachedRegion& region : cache) {
-        if (address >= region.start && address < region.end &&
-            now - region.stamp_ms <= RegionCacheMs) {
-            out = region;
+    const u64 now = NowMs();
+    for (const CachedRegion& cached : cache) {
+        if (address >= cached.region.start && address < cached.region.end &&
+            now - cached.stamp_ms <= RegionCacheMs) {
+            out = cached.region;
             return true;
         }
     }
-    MEMORY_BASIC_INFORMATION info{};
-    if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0) {
+    if (!Platform::QueryRegion(address, out)) {
         return false;
     }
-    CachedRegion& slot = cache[next];
+    cache[next] = {out, now};
     next = (next + 1) % RegionCacheSize;
-    slot.start = reinterpret_cast<u64>(info.BaseAddress);
-    slot.end = slot.start + info.RegionSize;
-    slot.state = info.State;
-    slot.protect = info.Protect;
-    slot.stamp_ms = now;
-    out = slot;
     return true;
 }
 
@@ -138,9 +137,8 @@ bool Readable(u64 address, size_t size) {
     u64 at = address;
     const u64 end = address + size;
     while (at < end) {
-        CachedRegion region;
-        if (!QueryRegion(at, region) || region.state != MEM_COMMIT ||
-            (region.protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        Platform::Region region;
+        if (!CachedQueryRegion(at, region) || !region.mapped || region.prot == 0) {
             return false;
         }
         at = region.end;
@@ -161,15 +159,16 @@ bool Matches(u64 offset, const u8* bytes, size_t size) {
 }
 
 void Write(u64 offset, const u8* bytes, size_t size) {
-    void* address = reinterpret_cast<void*>(EbootBase + offset);
-    DWORD old = 0;
-    if (!VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &old)) {
+    const u64 address = EbootBase + offset;
+    u32 restore = 0;
+    if (!Platform::Protect(address, size,
+                           Platform::ProtRead | Platform::ProtWrite | Platform::ProtExec,
+                           &restore)) {
         return;
     }
-    std::memcpy(address, bytes, size);
-    DWORD ignored = 0;
-    VirtualProtect(address, size, old, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), address, size);
+    std::memcpy(reinterpret_cast<void*>(address), bytes, size);
+    Platform::Restore(address, size, restore);
+    Platform::FlushCode(address, size);
 }
 
 struct Site {
@@ -241,18 +240,10 @@ u64 FindEbootBase() {
     if (fits(ForkEbootBase)) {
         return ForkEbootBase;
     }
-    constexpr DWORD Executable = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
-                                 PAGE_EXECUTE_WRITECOPY;
-    MEMORY_BASIC_INFORMATION info{};
-    u64 at = 0x10000;
-    while (at < 0x7FFF'FFFF'0000ULL &&
-           VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) != 0) {
-        const u64 base = reinterpret_cast<u64>(info.BaseAddress);
-        if (info.State == MEM_COMMIT && (info.Protect & Executable) != 0 &&
-            (info.Protect & PAGE_GUARD) == 0 && fits(base)) {
+    for (const u64 base : Platform::ExecutableRegions()) {
+        if (fits(base)) {
             return base;
         }
-        at = base + info.RegionSize;
     }
     return 0;
 }
@@ -307,42 +298,35 @@ int SyncSites() {
 // LICENSE.txt (the GPL) and NOTICE.txt (copyright + source link) ship in the mod folder so a copy
 // passed on keeps them. Missing or emptied -> BBSC stays off and says why.
 bool NoticesPresent() {
-    auto holds = [](const wchar_t* name, const char* text) {
-        FILE* file = _wfopen((mod_dir / name).c_str(), L"rb");
-        if (file == nullptr) {
-            return false;
-        }
+    auto holds = [](const char* name, const char* text) {
+        std::ifstream file(mod_dir / name, std::ios::binary);
         std::string content(64 * 1024, '\0');
-        content.resize(fread(content.data(), 1, content.size(), file));
-        fclose(file);
+        file.read(content.data(), static_cast<std::streamsize>(content.size()));
+        content.resize(static_cast<size_t>(file.gcount()));
         return content.find(text) != std::string::npos;
     };
     // SUPPORTERS.txt (2026-10-11, the user): the supporters list travels with BBSC like the
     // license; its names change freely, only the file and its header are required.
-    return holds(L"LICENSE.txt", "GNU GENERAL PUBLIC LICENSE") &&
-           holds(L"NOTICE.txt", "github.com/Classmg22/BBSC") &&
-           holds(L"SUPPORTERS.txt", "BBSC SUPPORTERS");
+    return holds("LICENSE.txt", "GNU GENERAL PUBLIC LICENSE") &&
+           holds("NOTICE.txt", "github.com/Classmg22/BBSC") &&
+           holds("SUPPORTERS.txt", "BBSC SUPPORTERS");
 }
 
-DWORD WINAPI Worker(void*) {
+void Worker() {
     OpenLog();
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
     BbscMod::LogPlain("BBSC mod loaded - version " BBSC_VERSION);
     if (!NoticesPresent()) {
         LOG_ERROR(Mod, "LICENSE.txt / NOTICE.txt / SUPPORTERS.txt missing or changed in {} - BBSC "
                        "is off",
                   Common::FS::PathToUTF8String(mod_dir));
-        MessageBoxW(nullptr,
-                    L"LICENSE.txt, NOTICE.txt or SUPPORTERS.txt is missing from the BBSC mod "
-                    L"folder (or was changed), so BBSC is off.\n\nThese files have to travel with "
-                    L"BBSC.\nDownload the full package again "
-                    L"from:\nhttps://github.com/Classmg22/BBSC",
-                    L"BBSC", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
-        return 0;
+        Platform::ShowError("BBSC", "LICENSE.txt, NOTICE.txt or SUPPORTERS.txt is missing from the "
+                                    "BBSC mod folder (or was changed), so BBSC is off.\n\nThese "
+                                    "files have to travel with BBSC.\nDownload the full package "
+                                    "again from:\nhttps://github.com/Classmg22/BBSC");
+        return;
     }
-    LOG_INFO(Mod, "BBSC mod in pid {} ({})", GetCurrentProcessId(),
-             Common::FS::PathToUTF8String(std::filesystem::path{exe}));
+    LOG_INFO(Mod, "BBSC mod in pid {} ({})", Platform::ProcessId(),
+             Common::FS::PathToUTF8String(Platform::ExecutablePath()));
     // Public servers (2026-10-11, shadNet's author: The Hunter's Dream is exact to the official
     // server, custom summon behaviour does not work there). Wozzardman's seamless summon patches
     // (cross-map sign search, host-placement summon build) and the 5-hunter search patches change
@@ -352,12 +336,8 @@ DWORD WINAPI Worker(void*) {
     {
         std::string server;
         if (BbscMod::GameServerIsPublic(&server)) {
-            const auto force_off = [](const char* name) {
-                _putenv_s(name, "0");
-                SetEnvironmentVariableA(name, "0");
-            };
-            force_off("BBSC_MOD_SEAMLESS");
-            force_off("SHADPS4_BBSC_FIVE_HUNTERS");
+            Platform::SetEnvironment("BBSC_MOD_SEAMLESS", "0");
+            Platform::SetEnvironment("SHADPS4_BBSC_FIVE_HUNTERS", "0");
             LOG_INFO(Mod, "Public game server ({}): vanilla summons - seamless summon patches and the "
                           "5-hunter search off (the session itself stays seamless)",
                      server);
@@ -365,15 +345,15 @@ DWORD WINAPI Worker(void*) {
     }
     BuildSites();
 
-    const DWORD started = GetTickCount();
+    const u64 started = NowMs();
     while ((EbootBase = FindEbootBase()) == 0) {
-        if (GetTickCount() - started > WaitForImageMs) {
+        if (NowMs() - started > WaitForImageMs) {
             LOG_ERROR(Mod, "No Bloodborne CUSA03173 01.09 image in memory after {} s - not this "
                            "game or not this version; nothing was changed",
                       WaitForImageMs / 1000);
-            return 0;
+            return;
         }
-        Sleep(50);
+        std::this_thread::sleep_for(50ms);
     }
     LOG_INFO(Mod, "Game image found at {:#x}{}", EbootBase,
              EbootBase == ForkEbootBase ? "" : " (not the shadp2p fork's address)");
@@ -381,21 +361,20 @@ DWORD WINAPI Worker(void*) {
     // shared hook code writes some code bytes directly. Make the image's code writable like shadPS4.
     {
         int unlocked = 0;
-        MEMORY_BASIC_INFORMATION info{};
+        Platform::Region region;
         u64 at = EbootBase;
-        while (at < EbootBase + EbootSize &&
-               VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) != 0) {
-            const u64 next = reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize;
-            if (info.State == MEM_COMMIT &&
-                (info.Protect == PAGE_EXECUTE_READ || info.Protect == PAGE_EXECUTE)) {
-                DWORD old = 0;
-                const u64 end = std::min<u64>(next, EbootBase + EbootSize);
-                if (VirtualProtect(info.BaseAddress, end - reinterpret_cast<u64>(info.BaseAddress),
-                                   PAGE_EXECUTE_READWRITE, &old)) {
+        while (at < EbootBase + EbootSize && Platform::QueryRegion(at, region)) {
+            if (region.mapped && (region.prot & Platform::ProtExec) != 0 &&
+                (region.prot & Platform::ProtWrite) == 0) {
+                const u64 start = std::max(region.start, EbootBase);
+                const u64 end = std::min<u64>(region.end, EbootBase + EbootSize);
+                if (Platform::Protect(start, end - start,
+                                      Platform::ProtRead | Platform::ProtWrite | Platform::ProtExec,
+                                      nullptr)) {
                     ++unlocked;
                 }
             }
-            at = next;
+            at = region.end;
         }
         if (unlocked != 0) {
             LOG_INFO(Mod, "Game code made writable ({} region(s)) - this host maps it read-only",
@@ -404,17 +383,17 @@ DWORD WINAPI Worker(void*) {
     }
     const Site* bad = nullptr;
     while (!AllSitesKnown(&bad)) {
-        if (GetTickCount() - started > WaitForImageMs) {
+        if (NowMs() - started > WaitForImageMs) {
             LOG_ERROR(Mod,
                       "No Bloodborne CUSA03173 01.09 image after {} s (first unknown site: {} at "
                       "{:#x}) - not this game or not this version; nothing was changed",
                       WaitForImageMs / 1000, bad ? bad->name : "?", bad ? bad->offset : 0);
-            return 0;
+            return;
         }
-        Sleep(1);
+        std::this_thread::sleep_for(1ms);
     }
-    Sleep(SettleMs);
-    const DWORD verified = GetTickCount() - started;
+    std::this_thread::sleep_for(SettleTime);
+    const u64 verified = NowMs() - started;
 
     MemoryPatcher::g_eboot_address = EbootBase;
     MemoryPatcher::g_eboot_image_size = EbootSize;
@@ -438,10 +417,10 @@ DWORD WINAPI Worker(void*) {
     BbscMod::InstallHttpWrappers();
     Core::Bbsc::InstallPadWrapper();
     BbscMod::StartDiscordStatus();
-    LOG_INFO(Mod, "BBSC mod ready after {} ms", GetTickCount() - started);
+    LOG_INFO(Mod, "BBSC mod ready after {} ms", NowMs() - started);
 
     for (;;) {
-        Sleep(WatchMs);
+        std::this_thread::sleep_for(WatchTime);
         std::scoped_lock lock{patch_mutex};
         if (const int redone = SyncSites(); redone != 0) {
             LOG_WARNING(Mod, "{} patch site(s) had changed back - written again", redone);
@@ -457,14 +436,17 @@ namespace BbscMod {
 
 void LogLine(char level, const char* category, const std::string& text) {
     std::scoped_lock lock{log_mutex};
-    if (log_file == nullptr) {
+    if (!log_file.is_open()) {
         return;
     }
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-    std::fprintf(log_file, "[%02u:%02u:%02u.%03u] %c %s: %s\n", now.wHour, now.wMinute, now.wSecond,
-                 now.wMilliseconds, level, category, text.c_str());
-    std::fflush(log_file);
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now.time_since_epoch()).count() % 1000;
+    char clock[16]{};
+    std::strftime(clock, sizeof(clock), "%H:%M:%S", std::localtime(&seconds));
+    log_file << fmt::format("[{}.{:03}] {} {}: {}\n", clock, millis, level, category, text)
+             << std::flush;
 }
 
 void LogPlain(const char* text) {
@@ -473,6 +455,24 @@ void LogPlain(const char* text) {
 
 u64 EbootAddress() {
     return EbootBase;
+}
+
+// The injected DLL's start-up (bbsc_platform_win32.cpp, DllMain): waits for the game, then
+// installs.
+void RunWorker() {
+    Worker();
+}
+
+// Writes an import slot of the game (an aligned 8-byte store, so a game thread reading the slot
+// sees the old or the new value, never half of each).
+void WriteSlot(u64 address, u64 value) {
+    u32 restore = 0;
+    const bool unlocked =
+        Platform::Protect(address, 8, Platform::ProtRead | Platform::ProtWrite, &restore);
+    *reinterpret_cast<volatile u64*>(address) = value;
+    if (unlocked) {
+        Platform::Restore(address, 8, restore);
+    }
 }
 
 // Import slots the DLL swapped for its wrappers (bbsc_http.cpp, bbsc_channel.cpp). The official
@@ -491,9 +491,9 @@ struct GuardedSlot {
 std::mutex guarded_mutex;
 std::vector<GuardedSlot> guarded_slots;
 
-DWORD WINAPI SlotGuardThread(void*) {
+void SlotGuardThread() {
     for (;;) {
-        Sleep(5);
+        std::this_thread::sleep_for(5ms);
         std::scoped_lock lock{guarded_mutex};
         for (auto& guarded : guarded_slots) {
             auto* slot = reinterpret_cast<volatile u64*>(EbootBase + guarded.slot_offset);
@@ -503,11 +503,7 @@ DWORD WINAPI SlotGuardThread(void*) {
                 continue;
             }
             *reinterpret_cast<void* volatile*>(guarded.original) = reinterpret_cast<void*>(value);
-            DWORD old = 0;
-            VirtualProtect(const_cast<u64*>(slot), 8, PAGE_READWRITE, &old);
-            *slot = guarded.wrapper;
-            DWORD ignored = 0;
-            VirtualProtect(const_cast<u64*>(slot), 8, old, &ignored);
+            WriteSlot(EbootBase + guarded.slot_offset, guarded.wrapper);
             if (++guarded.rewritten <= 3) {
                 LOG_INFO(Mod, "Import {} was linked again by the emulator - wrapper put back ({}x)",
                          guarded.name, guarded.rewritten);
@@ -520,9 +516,7 @@ DWORD WINAPI SlotGuardThread(void*) {
 void GuardSlot(u64 slot_offset, u64 wrapper, void** original, const char* name) {
     std::scoped_lock lock{guarded_mutex};
     if (guarded_slots.empty()) {
-        if (HANDLE thread = CreateThread(nullptr, 0, SlotGuardThread, nullptr, 0, nullptr)) {
-            CloseHandle(thread);
-        }
+        std::thread(SlotGuardThread).detach();
     }
     guarded_slots.push_back({slot_offset, wrapper, original, name});
 }
@@ -538,44 +532,19 @@ bool MemoryManager::IsValidMapping(u64 address, u64 size) {
 }
 
 s32 MemoryManager::QueryProtection(u64 address, void** start, void** end, u32* prot) {
-    CachedRegion info;
-    if (!QueryRegion(address, info) || info.state != MEM_COMMIT) {
+    Platform::Region region;
+    if (!CachedQueryRegion(address, region) || !region.mapped) {
         return -1;
     }
-    *start = reinterpret_cast<void*>(info.start);
-    *end = reinterpret_cast<void*>(info.end);
-    u32 bits = 0;
-    switch (info.protect & 0xFF) {
-    case PAGE_READONLY:
-        bits = 1;
-        break;
-    case PAGE_READWRITE:
-    case PAGE_WRITECOPY:
-        bits = 3;
-        break;
-    case PAGE_EXECUTE_READ:
-        bits = 5;
-        break;
-    case PAGE_EXECUTE_READWRITE:
-    case PAGE_EXECUTE_WRITECOPY:
-        bits = 7;
-        break;
-    case PAGE_EXECUTE:
-        bits = 4;
-        break;
-    default:
-        bits = 0;
-    }
-    if ((info.protect & PAGE_GUARD) != 0) {
-        bits = 0;
-    }
-    *prot = bits;
+    *start = reinterpret_cast<void*>(region.start);
+    *end = reinterpret_cast<void*>(region.end);
+    *prot = region.prot;
     return 0;
 }
 
 namespace Debugger {
 int GetCurrentPid() {
-    return static_cast<int>(GetCurrentProcessId());
+    return static_cast<int>(Platform::ProcessId());
 }
 } // namespace Debugger
 
@@ -609,113 +578,14 @@ void SetHostLampPatches(bool hosting) {
 }
 
 // The F1 camera. The emulator build feeds it from its SDL window events (bbsc_cinematic.cpp); a mod
-// sees no window events, so the keys are polled here instead, only while this process's window is
-// in front (Nucleus runs two). While it is on, CineWindowProc keeps the keys and the mouse from the
-// game (2026-10-12; before, they reached it too). bloodborne_re.cpp turns it on by itself when you
-// die in co-op and off when you respawn.
-// 2026-10-05 (the user: better mouse controls): the mouse looks around without a button held - the
-// cursor is hidden and kept in the middle of the game window - and the wheel sets the speed (the
-// game window is subclassed for WM_MOUSEWHEEL / WM_SETCURSOR while the camera is on; PageUp /
-// PageDown still work).
+// sees no window events, so the keys are polled here instead (Platform::KeyDown), only while this
+// process's window has the keyboard (Nucleus runs two). bloodborne_re.cpp turns it on by itself
+// when you die in co-op and off when you respawn. The mouse looks around without a button held and
+// the wheel sets the speed (Platform::TakeMouseLook; PageUp / PageDown still work).
+using Platform::Key;
 std::mutex cine_mutex;
 CinematicInput cine_state;
-std::array<bool, 256> cine_was_down{};
-bool cine_looking = false;
-POINT cine_anchor{};
-HWND cine_window = nullptr;          // the subclassed game window (SDL's "SDL_app")
-WNDPROC cine_window_proc = nullptr;  // its own window procedure
-std::atomic<bool> cine_mouse_owned{false}; // the camera is on and has the mouse
-std::atomic<int> cine_wheel{0};      // wheel notches since the last TakeCinematicInput
-
-LRESULT CALLBACK CineWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    if (cine_mouse_owned) {
-        if (message == WM_MOUSEWHEEL) {
-            const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
-            cine_wheel += delta > 0 ? 1 : (delta < 0 ? -1 : 0);
-            return 0; // not for the game
-        }
-        if (message == WM_SETCURSOR && LOWORD(lparam) == HTCLIENT) {
-            SetCursor(nullptr);
-            return TRUE;
-        }
-        // 2026-10-12 (the user: "each button does a million things"): the camera's keys walked,
-        // dodged and used items at the same time, and the mouse turned the game's camera. While
-        // the camera is on, presses and movement stop here; the emulator (SDL) never sees them.
-        // Releases still go through, so a key held when the camera came on is not left stuck.
-        // The camera reads the keys itself (GetAsyncKeyState), so it is not affected. Alt+F4 passes.
-        switch (message) {
-        case WM_KEYDOWN:
-        case WM_CHAR:
-        case WM_DEADCHAR:
-        case WM_SYSCHAR:
-        case WM_LBUTTONDOWN:
-        case WM_LBUTTONDBLCLK:
-        case WM_RBUTTONDOWN:
-        case WM_RBUTTONDBLCLK:
-        case WM_MBUTTONDOWN:
-        case WM_MBUTTONDBLCLK:
-        case WM_XBUTTONDOWN:
-        case WM_XBUTTONDBLCLK:
-        case WM_MOUSEMOVE:
-            return 0;
-        case WM_SYSKEYDOWN:
-            if (wparam != VK_F4) {
-                return 0;
-            }
-            break;
-        case WM_INPUT: {
-            // Raw input (SDL's relative mouse): drop movement and presses, keep releases.
-            RAWINPUT raw{};
-            UINT size = sizeof(raw);
-            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lparam), RID_INPUT, &raw, &size,
-                                sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1)) {
-                bool release = false;
-                if (raw.header.dwType == RIM_TYPEKEYBOARD) {
-                    release = (raw.data.keyboard.Flags & RI_KEY_BREAK) != 0;
-                } else if (raw.header.dwType == RIM_TYPEMOUSE) {
-                    constexpr USHORT Ups = RI_MOUSE_BUTTON_1_UP | RI_MOUSE_BUTTON_2_UP |
-                                           RI_MOUSE_BUTTON_3_UP | RI_MOUSE_BUTTON_4_UP |
-                                           RI_MOUSE_BUTTON_5_UP;
-                    release = (raw.data.mouse.usButtonFlags & Ups) != 0;
-                }
-                if (!release) {
-                    return DefWindowProcW(window, message, wparam, lparam);
-                }
-            }
-            break;
-        }
-        default:
-            break;
-        }
-    }
-    return CallWindowProcW(cine_window_proc, window, message, wparam, lparam);
-}
-
-// The game window when it is in front, else nullptr. Subclassed the first time it is seen.
-HWND CineGameWindowInFront() {
-    HWND window = GetForegroundWindow();
-    DWORD pid = 0;
-    GetWindowThreadProcessId(window, &pid);
-    if (window == nullptr || pid != GetCurrentProcessId()) {
-        return nullptr;
-    }
-    char cls[32]{};
-    GetClassNameA(window, cls, sizeof(cls));
-    if (std::strcmp(cls, "SDL_app") != 0) {
-        return nullptr; // e.g. the console
-    }
-    if (cine_window != window) {
-        if (cine_window != nullptr && cine_window_proc != nullptr) {
-            SetWindowLongPtrW(cine_window, GWLP_WNDPROC,
-                              reinterpret_cast<LONG_PTR>(cine_window_proc));
-        }
-        cine_window = window;
-        cine_window_proc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-            window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&CineWindowProc)));
-        LOG_INFO(Debug, "BBSC cinematic camera: mouse wheel and cursor hooked on the game window");
-    }
-    return window;
-}
+std::array<bool, static_cast<size_t>(Key::Count)> cine_was_down{};
 
 // The controller: the game's scePadReadState import slot (0x053E4EA0, tools/gamedata/
 // eboot_imports.py) is swapped for PadReadState below, which sees the pad data the emulator hands
@@ -782,74 +652,68 @@ int PS4_SYSV_ABI PadReadState(s32 handle, u8* data) {
 }
 
 void InstallPadWrapper() {
-    auto* slot = reinterpret_cast<u64*>(EbootBase + PadReadStateSlot);
+    const u64 slot = EbootBase + PadReadStateSlot;
     for (int i = 0; i < 60'000; ++i) {
-        const u64 value = *slot;
+        const u64 value = *reinterpret_cast<const volatile u64*>(slot);
         if (value != 0 && (value < EbootBase || value >= EbootBase + EbootSize)) {
             original_pad_read = reinterpret_cast<PadReadStateFn>(value);
-            DWORD old = 0;
-            VirtualProtect(slot, 8, PAGE_READWRITE, &old);
-            *slot = reinterpret_cast<u64>(&PadReadState);
-            DWORD ignored = 0;
-            VirtualProtect(slot, 8, old, &ignored);
+            BbscMod::WriteSlot(slot, reinterpret_cast<u64>(&PadReadState));
             LOG_INFO(Mod, "Pad: controller works the F1 camera too (L3 + R3)");
             return;
         }
-        Sleep(1);
+        std::this_thread::sleep_for(1ms);
     }
     LOG_WARNING(Mod, "Pad: scePadReadState slot never filled - F1 camera keyboard only");
 }
 
-bool CineKeyPressed(int key, bool down) {
-    const bool pressed = down && !cine_was_down[key];
-    cine_was_down[key] = down;
+bool CineKeyPressed(Key key, bool down) {
+    bool& was_down = cine_was_down[static_cast<size_t>(key)];
+    const bool pressed = down && !was_down;
+    was_down = down;
     return pressed;
 }
 
 CinematicInput TakeCinematicInput() {
     std::scoped_lock lock{cine_mutex};
-    DWORD pid = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-    const bool front = pid == GetCurrentProcessId();
-    auto down = [front](int key) { return front && (GetAsyncKeyState(key) & 0x8000) != 0; };
-    if (CineKeyPressed(VK_F1, down(VK_F1))) {
+    const auto down = [](Key key) { return Platform::KeyDown(key); };
+    if (CineKeyPressed(Key::F1, down(Key::F1))) {
         const bool enabled = !cine_state.enabled;
         cine_state = CinematicInput{};
         cine_state.enabled = enabled;
         LOG_INFO(Debug, "BBSC cinematic camera: {} (F1)", enabled ? "on" : "off");
     }
     if (!cine_state.enabled) {
-        cine_looking = false;
-        cine_mouse_owned = false;
-        cine_wheel = 0;
+        Platform::ReleaseMouse();
         return {};
     }
     CinematicInput& c = cine_state;
     const CinePad& p = cine_pad;
-    c.forward = down('W');
-    c.back = down('S');
-    c.left = down('A');
-    c.right = down('D');
-    c.up = down('E') || down(VK_SPACE);
-    c.down = down('Q') || down('C');
-    c.fast = down(VK_SHIFT) || (p.buttons & PadCross) != 0;
-    c.slow = down(VK_MENU) || (p.buttons & PadSquare) != 0;
-    c.zoom_in = down('Z');
-    c.zoom_out = down('X');
-    c.zoom_reset = CineKeyPressed('V', down('V')) || p.zoom_reset;
+    const Platform::MouseLook mouse = Platform::TakeMouseLook();
+    c.forward = down(Key::W);
+    c.back = down(Key::S);
+    c.left = down(Key::A);
+    c.right = down(Key::D);
+    c.up = down(Key::E) || down(Key::Space);
+    c.down = down(Key::Q) || down(Key::C);
+    c.fast = down(Key::Shift) || (p.buttons & PadCross) != 0;
+    c.slow = down(Key::Alt) || (p.buttons & PadSquare) != 0;
+    c.zoom_in = down(Key::Z);
+    c.zoom_out = down(Key::X);
+    c.zoom_reset = CineKeyPressed(Key::V, down(Key::V)) || p.zoom_reset;
     cine_pad.zoom_reset = false;
-    c.roll_left = down(VK_OEM_COMMA);
-    c.roll_right = down(VK_OEM_PERIOD);
-    c.roll_reset = CineKeyPressed(VK_OEM_2, down(VK_OEM_2));
-    c.look_up = down(VK_UP);
-    c.look_down = down(VK_DOWN);
-    c.look_left = down(VK_LEFT);
-    c.look_right = down(VK_RIGHT);
-    c.wheel = (CineKeyPressed(VK_PRIOR, down(VK_PRIOR)) ? 1 : 0) -
-              (CineKeyPressed(VK_NEXT, down(VK_NEXT)) ? 1 : 0) + p.speed_steps +
-              cine_wheel.exchange(0);
-    c.smooth_steps = (CineKeyPressed(VK_OEM_6, down(VK_OEM_6)) ? 1 : 0) -
-                     (CineKeyPressed(VK_OEM_4, down(VK_OEM_4)) ? 1 : 0) + p.smooth_steps;
+    c.roll_left = down(Key::Comma);
+    c.roll_right = down(Key::Period);
+    c.roll_reset = CineKeyPressed(Key::Slash, down(Key::Slash));
+    c.look_up = down(Key::Up);
+    c.look_down = down(Key::Down);
+    c.look_left = down(Key::Left);
+    c.look_right = down(Key::Right);
+    c.wheel = (CineKeyPressed(Key::PageUp, down(Key::PageUp)) ? 1 : 0) -
+              (CineKeyPressed(Key::PageDown, down(Key::PageDown)) ? 1 : 0) + p.speed_steps +
+              mouse.wheel;
+    c.smooth_steps = (CineKeyPressed(Key::RightBracket, down(Key::RightBracket)) ? 1 : 0) -
+                     (CineKeyPressed(Key::LeftBracket, down(Key::LeftBracket)) ? 1 : 0) +
+                     p.smooth_steps;
     cine_pad.speed_steps = 0;
     cine_pad.smooth_steps = 0;
     c.pad_move_x = p.lx;
@@ -858,37 +722,22 @@ CinematicInput TakeCinematicInput() {
     c.pad_look_x = p.rx;
     c.pad_look_y = -p.ry;
     c.pad_zoom = p.r2 - p.l2;
-    // Mouse look, no button needed: the cursor's movement, put back in the middle of the game
-    // window each frame (hidden there by CineWindowProc).
-    c.mouse_dx = 0.0f;
-    c.mouse_dy = 0.0f;
-    POINT now{};
-    RECT client{};
-    HWND window = front ? CineGameWindowInFront() : nullptr;
-    if (window != nullptr && GetClientRect(window, &client) && GetCursorPos(&now)) {
-        POINT center{(client.left + client.right) / 2, (client.top + client.bottom) / 2};
-        ClientToScreen(window, &center);
-        if (cine_looking) {
-            c.mouse_dx = static_cast<float>(now.x - cine_anchor.x);
-            c.mouse_dy = static_cast<float>(now.y - cine_anchor.y);
-        }
-        cine_anchor = center;
-        cine_looking = true;
-        SetCursorPos(center.x, center.y);
-        cine_mouse_owned = true;
-    } else {
-        cine_looking = false; // another window is in front: the mouse is the user's
-        cine_mouse_owned = false;
-    }
+    c.mouse_dx = mouse.dx;
+    c.mouse_dy = mouse.dy;
     return c;
+}
+
+// F8 (bloodborne_re.cpp, TickBbscUnstuckKey): true once per press in the game window.
+bool TakeUnstuckKey() {
+    std::scoped_lock lock{cine_mutex};
+    return CineKeyPressed(Key::F8, Platform::KeyDown(Key::F8));
 }
 
 void CinematicForceOff() {
     std::scoped_lock lock{cine_mutex};
     cine_state = CinematicInput{};
     cine_pad = CinePad{.last_buttons = cine_pad.last_buttons};
-    cine_looking = false;
-    cine_mouse_owned = false;
+    Platform::ReleaseMouse();
 }
 
 void CinematicForceOn() {
@@ -899,7 +748,7 @@ void CinematicForceOn() {
     cine_state = CinematicInput{};
     cine_state.enabled = true;
     cine_pad = CinePad{.last_buttons = cine_pad.last_buttons};
-    cine_looking = false;
+    Platform::ReleaseMouse();
 }
 
 } // namespace Bbsc
@@ -916,14 +765,3 @@ int BbscReplayRoomMembers(bool) {
     return 0; // the emulator's room cache is out of reach for a mod
 }
 } // namespace Libraries::Np::NpMatching2
-
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        self_module = module;
-        DisableThreadLibraryCalls(module);
-        if (HANDLE thread = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr)) {
-            CloseHandle(thread);
-        }
-    }
-    return TRUE;
-}

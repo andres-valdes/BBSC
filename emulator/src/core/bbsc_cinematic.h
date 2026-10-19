@@ -42,4 +42,7 @@ void CinematicForceOff();
 // Game thread: switches the camera on (you died in co-op); nothing when it is already on.
 void CinematicForceOn();
 
+// Game thread, mod only: true once per press of F8 (unstuck) in the game window.
+bool TakeUnstuckKey();
+
 } // namespace Core::Bbsc
